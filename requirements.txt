@@ -1,0 +1,7 @@
+flask[async]
+streamlit
+httpx
+beautifulsoup4
+textstat
+pandas
+python-dotenv
