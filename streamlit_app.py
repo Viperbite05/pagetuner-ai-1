@@ -1,188 +1,229 @@
-import streamlit as st
+import os
+import httpx
+import json
 import asyncio
-import pandas as pd
-import io
-from analyzer import analyze_url # Our core logic is imported
+from bs4 import BeautifulSoup
+import textstat
+from dotenv import load_dotenv
 
-# --- Page Configuration ---
-# Set the page to be wide
-st.set_page_config(
-    page_title="PageTuner AI",
-    layout="wide"
-)
+# Load environment variables from .env file
+load_dotenv()
 
-# --- CSV Generation Function ---
-# We copy this helper function directly from our Flask app
-def flatten_results_for_csv(results):
-    """Converts the nested result dictionaries into a flat list for pandas."""
-    flat_data = []
-    for result in results:
-        if result.get('error'):
-            row = {'URL': result.get('url'), 'Error': result.get('error')}
-            flat_data.append(row)
-            continue
-            
-        # Get the new meta analysis data
-        meta_analysis = result.get('meta_analysis', {})
-        tags = meta_analysis.get('tags', {})
-        title_info = tags.get('title', {})
-        meta_info = tags.get('meta_description', {})
-        llm_sugs = meta_analysis.get('llm_suggestions', {})
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-        row = {
-            'URL': result.get('url'),
-            'Title': result.get('title'),
-            'Title Text': title_info.get('text'), # <-- NEW
-            'Title Length': title_info.get('length'), # <-- NEW
-            'Title Status': title_info.get('status'), # <-- NEW
-            'Meta Description Text': meta_info.get('text'), # <-- NEW
-            'Meta Description Length': meta_info.get('length'), # <-- NEW
-            'Meta Description Status': meta_info.get('status'), # <-- NEW
-            'LLM Title Suggestions': llm_sugs.get('suggestions', ''), # <-- NEW
-            'Readability (Flesch Ease)': result.get('readability', {}).get('flesch_reading_ease'),
-            'Structural Integrity - Headings': "\n".join(result.get('structural_integrity', {}).get('headings', [])),
-            'Structural Integrity - Semantics': "\n".join(result.get('structural_integrity', {}).get('semantics', [])),
-            'Existing Article Schema?': result.get('existing_schema', {}).get('Article'),
-            'Existing FAQ Schema?': result.get('existing_schema', {}).get('FAQPage'),
-            'Generated Article Schema': result.get('recommendations', {}).get('article_schema'),
-            'Generated FAQ Schema': result.get('recommendations', {}).get('faq_schema'),
-            'Content Structure Suggestions': result.get('content_structure', {}).get('heading_suggestions'),
-            'Identified Content Gaps': result.get('topical_gaps', {}).get('raw_text')
-        }
-        flat_data.append(row)
-    return flat_data
-
-# --- Async Runner ---
-# Streamlit runs in a way that needs this helper to call our async code
-async def run_analysis(urls):
-    return await asyncio.gather(*(analyze_url(url) for url in urls))
-
-# --- PageTuner AI Dashboard ---
-st.title("🤖 PageTuner AI")
-st.caption("On-page optimization for technical and semantic structure.")
-
-# --- URL Input ---
-urls_text = st.text_area("Enter URLs (one per line, max 500)", height=200, placeholder="https://www.example.com/article1\nhttps://www.example.com/article2")
-
-# --- Run Analysis Button ---
-if st.button("Analyze URLs", type="primary"):
-    urls = [url.strip() for url in urls_text.splitlines() if url.strip()]
-    
-    if not urls:
-        st.error("Please enter at least one URL.")
-    elif len(urls) > 500:
-        st.error("Maximum of 500 URLs allowed.")
-    else:
-        # Run the analysis with a spinner
-        with st.spinner(f"Analyzing {len(urls)} page(s)... This may take a moment."):
-            try:
-                # Run our async functions
-                analysis_results = asyncio.run(run_analysis(urls))
-                # Store results in Streamlit's session state
-                st.session_state['results'] = analysis_results
-                st.success("Analysis complete!")
-            except Exception as e:
-                st.exception(f"An unexpected error occurred: {e}")
-
-# --- Display Results ---
-# Check if results exist in the session state
-if 'results' in st.session_state:
-    results = st.session_state['results']
-    
-    st.header("Analysis Report", divider="blue")
-
-    # --- Download Button ---
+async def fetch_page(client, url):
+    """Asynchronously fetches the content of a URL."""
     try:
-        flat_data = flatten_results_for_csv(results)
-        df = pd.DataFrame(flat_data)
-        # Create an in-memory CSV
-        csv_output = df.to_csv(index=False).encode('utf-8')
-        
-        st.download_button(
-            label="Download CSV Report",
-            data=csv_output,
-            file_name="pagetuner_report.csv",
-            mime="text/csv",
-        )
-    except Exception as e:
-        st.error(f"Could not prepare CSV for download: {e}")
-        
-    # --- Individual Page Reports ---
-    for result in results:
-        if result.get('error'):
-            with st.expander(f"❌ Error Analyzing: {result.get('url')}", expanded=True):
-                st.error(result.get('error'))
-            continue
+        response = await client.get(url, follow_redirects=True, timeout=15.0)
+        response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
+        return response.text
+    except httpx.RequestError as exc:
+        return f"An error occurred while requesting {exc.request.url!r}: {exc}"
 
-        # Use an expander for each URL
-        with st.expander(f"✅ {result.get('title')}"):
-            st.link_button("Open URL in New Tab", result.get('url'))
+def analyze_heading_structure(soup):
+    """Analyzes heading tags (h1-h6) for hierarchy violations."""
+    findings = []
+    headings = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
+    
+    h1_tags = soup.find_all('h1')
+    if len(h1_tags) == 0:
+        findings.append("❌ **Error:** No `<h1>` tag found.")
+    elif len(h1_tags) > 1:
+        findings.append(f"⚠️ **Warning:** Found {len(h1_tags)} `<h1>` tags. There should only be one.")
+
+    if len(headings) > 1:
+        last_level = int(headings[0].name[1])
+        for i in range(1, len(headings)):
+            current_level = int(headings[i].name[1])
+            if current_level > last_level + 1:
+                findings.append(f"❌ **Hierarchy Error:** Skipped from `<h{last_level}>` to `<h{current_level}>`. Text: \"{headings[i].get_text(strip=True)[:50]}...\"")
+            last_level = current_level
             
-            # Create two columns for a cleaner layout
-            col1, col2 = st.columns(2)
+    if not findings:
+        findings.append("✅ **Success:** Heading structure is logical.")
+        
+    return findings
 
-            with col1:
-                # --- NEW SECTION: Title & Meta Analysis ---
-                st.subheader("Title & Meta Analysis")
-                meta_data = result.get('meta_analysis', {})
-                tags_data = meta_data.get('tags', {})
-                llm_data = meta_data.get('llm_suggestions', {})
-                
-                # Title
-                title_info = tags_data.get('title', {})
-                st.metric(f"Title Length ({title_info.get('status')})", f"{title_info.get('length')} / 65")
-                st.markdown("**Current Title**")
-                st.code(title_info.get('text'), language=None)
-                
-                # Meta Description
-                meta_info = tags_data.get('meta_description', {})
-                st.metric(f"Meta Desc. Length ({meta_info.get('status')})", f"{meta_info.get('length')} / 160")
-                st.markdown("**Current Meta Desc**")
-                st.code(meta_info.get('text'), language=None)
-                
-                # LLM Suggestions
-                st.markdown("**LLM Title Recommendations:**")
-                if llm_data and not llm_data.get('error'):
-                    st.code(llm_data.get('suggestions'), language=None)
-                else:
-                    st.info("No title suggestions were generated.")
-                # --- END OF NEW SECTION ---
-                # Section 1: Recommendations
-                st.subheader("Recommendations & Generated Assets")
-                st.markdown("**Article Schema:**")
-                if result.get('existing_schema', {}).get('Article'):
-                    st.success("Article Schema already detected on page.")
-                elif result.get('recommendations', {}).get('article_schema'):
-                    st.warning("Article Schema missing. Generated schema below:")
-                    st.code(result.get('recommendations').get('article_schema'), language="json")
-                
-                st.markdown("**FAQ Schema:**")
-                if result.get('existing_schema', {}).get('FAQPage'):
-                    st.success("FAQ Schema already detected on page.")
-                elif result.get('recommendations', {}).get('faq_schema'):
-                    st.warning("FAQ Schema missing. Generated schema below:")
-                    st.code(result.get('recommendations').get('faq_schema'), language="json")
-                
-                # Section 2: Content Structure
-                st.subheader("Content Structure Recommendations")
-                if result.get('content_structure') and not result.get('content_structure').get('error'):
-                    # Use st.markdown to render the H2/H3s
-                    st.markdown(result.get('content_structure').get('heading_suggestions'))
-                else:
-                    st.info("Could not generate heading suggestions.")
+def audit_semantic_html(soup):
+    """Performs a basic audit of semantic HTML tag usage."""
+    findings = []
+    
+    for tag in soup.find_all(['strong', 'b']):
+        if not tag.get_text(strip=True):
+            findings.append("⚠️ **Warning:** Found an empty `<strong>` or `<b>` tag.")
+            
+    for list_tag in soup.find_all(['ul', 'ol']):
+        invalid_children = [child.name for child in list_tag.children if child.name and child.name != 'li']
+        if invalid_children:
+            findings.append(f"❌ **Structure Error:** Found a `<{list_tag.name}>` tag with invalid direct children: {invalid_children}. Only `<li>` tags are allowed.")
 
-            with col2:
-                # Section 3: Structural Integrity
-                st.subheader("Structural Integrity")
-                for finding in result.get('structural_integrity', {}).get('headings', []):
-                    st.markdown(finding) # Use markdown to render emoji/bold
-                for finding in result.get('structural_integrity', {}).get('semantics', []):
-                    st.markdown(finding)
-                
-                # Section 4: Readability
-                st.subheader("Readability")
-                st.metric("Flesch Reading Ease", result.get('readability', {}).get('flesch_reading_ease'))
-                
-                # Section 5: Topical Gaps
-                st.subheader("Identified Content Gaps (LLM Output)")
-                st.text(result.get('topical_gaps', {}).get('raw_text'))
+    if not findings:
+        findings.append("✅ **Success:** Basic semantic HTML looks good.")
+        
+    return findings
+
+def analyze_readability(text):
+    """Calculates readability score."""
+    score = textstat.flesch_reading_ease(text)
+    return {"flesch_reading_ease": score}
+
+async def get_topical_gaps(client, title, text_content):
+    """Uses Groq API to find topical gaps and generate Q&A pairs."""
+    if not GROQ_API_KEY:
+        return {"error": "GROQ_API_KEY not found."}
+    
+    prompt = f"""
+    An article's main topic is "{title}".
+    1. Identify key sub-topics or common questions related to this topic that are missing from the article text provided below. Please note that these questions or topics should be related to amazon and the business being discussed. Basically, both the questions and answers should be found within the article, we're just cleaning it up and presenting it better.
+    2. Based ONLY on the missing topics, generate 3-5 relevant question and answer pairs suitable for an FAQ section.
+    3. VERY IMPORTANT: Format the output as a clean list, with each question starting with "Q:" and each answer starting with "A:". Do not add any other conversational text or introduction. This text will be customer facing, so please prepare it as a clear marketing copy. 
+
+    ARTICLE TEXT TO ANALYZE:
+    {text_content[:4000]}
+    """
+    payload = {"model": "llama-3.1-8b-instant", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7}
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+
+    try:
+        response = await client.post(GROQ_API_URL, json=payload, headers=headers, timeout=30.0)
+        response.raise_for_status()
+        data = response.json()
+        
+        qna_text = data['choices'][0]['message']['content']
+        qna_pairs = []
+        for line in qna_text.strip().split('\n'):
+            if line.startswith('Q:'):
+                qna_pairs.append({'question': line[2:].strip(), 'answer': ''})
+            elif line.startswith('A:') and qna_pairs:
+                qna_pairs[-1]['answer'] = line[2:].strip()
+        
+        return {"raw_text": qna_text, "structured_qna": qna_pairs}
+    except Exception as e:
+        return {"error": f"An error occurred with the LLM API: {e}", "raw_text": "", "structured_qna": []}
+
+def audit_for_schema(soup):
+    """Checks for existing Article and FAQPage schema."""
+    found_schema = {'Article': False, 'FAQPage': False}
+    script_tags = soup.find_all('script', type='application/ld+json')
+    for tag in script_tags:
+        try:
+            data = json.loads(tag.string)
+            graph = data.get('@graph', [data])
+            for item in graph:
+                schema_type = item.get('@type')
+                if schema_type == 'Article':
+                    found_schema['Article'] = True
+                elif schema_type == 'FAQPage':
+                    found_schema['FAQPage'] = True
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    return found_schema
+
+def generate_article_schema(soup, url):
+    """Generates basic Article JSON-LD schema."""
+    title = soup.find('h1').get_text(strip=True) if soup.find('h1') else "No H1 Title Found"
+    schema = {"@context": "https://schema.org", "@type": "Article", "headline": title, "mainEntityOfPage": {"@type": "WebPage", "@id": url}}
+    return json.dumps(schema, indent=4)
+
+def generate_faq_schema(qna_pairs):
+    """Generates FAQPage JSON-LD schema from structured Q&A pairs."""
+    if not qna_pairs:
+        return None
+    main_entity = []
+    for pair in qna_pairs:
+        if pair['question'] and pair['answer']:
+            main_entity.append({"@type": "Question", "name": pair['question'], "acceptedAnswer": {"@type": "Answer", "text": pair['answer']}})
+    if not main_entity:
+        return None
+    schema = {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": main_entity}
+    return json.dumps(schema, indent=4)
+
+async def get_content_structure_recommendations(client, text_content):
+    """Uses the LLM to suggest headings for long-form text."""
+    if not GROQ_API_KEY:
+        return {"error": "GROQ_API_KEY not found."}
+
+    cleaned_text = ' '.join(text_content.split())
+    
+    ### ▼▼▼ MODIFIED PROMPT ▼▼▼ ###
+    prompt = f"""
+    Analyze the following article text, which is long and lacks sufficient headings. Your task is to improve its scannability and structure by suggesting headings.
+
+    1. Read through the text and identify **major** logical breaks where a new, **substantial** sub-topic begins.
+    2. Suggest a concise and descriptive heading for these breaks. Use H2s for major topics and H3s for sub-topics.
+    3. **CRITICAL RULE:** Do not suggest new headings that are too close together. Ensure there are at least 1-2 paragraphs of substantial content *between* each suggested heading to avoid over-structuring the article.
+    4. Present your recommendations as a outline using text headers like "H2" or "h3". Do not rewrite the original text. Please include the first sentence of the paragraph that is after the heading to idenyify location. 
+
+    Example Output:
+    ## New Suggested H2
+    ### New Suggested H3
+    ## Another New Suggested H2
+
+    ARTICLE TEXT TO ANALYZE:
+    {cleaned_text[:6000]}
+    """
+    ### ▲▲▲ END OF MODIFIED PROMPT ▲▲▲ ###
+    
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.5,
+    }
+    headers = { "Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json" }
+
+    try:
+        response = await client.post(GROQ_API_URL, json=payload, headers=headers, timeout=45.0)
+        response.raise_for_status()
+        data = response.json()
+        return {"heading_suggestions": data['choices'][0]['message']['content']}
+    except Exception as e:
+        return {"error": f"An error occurred with the LLM API: {e}", "heading_suggestions": ""}
+
+async def analyze_url(url):
+    """Main analysis orchestrator for a single URL."""
+    async with httpx.AsyncClient() as client:
+        html_content = await fetch_page(client, url)
+
+        if html_content.startswith("An error occurred"):
+            return {"url": url, "error": html_content}
+
+        soup = BeautifulSoup(html_content, 'html.parser')
+        main_content = soup.find('main') or soup.find('article') or soup.body
+        text_content = main_content.get_text()
+        title = soup.find('title').string if soup.find('title') else "No Title Found"
+
+        (topical_findings, structure_recommendations) = await asyncio.gather(
+            get_topical_gaps(client, title, text_content),
+            get_content_structure_recommendations(client, text_content)
+        )
+# ▼▼▼ ADD THESE TWO LINES FOR DEBUGGING ▼▼▼
+        print(f"DEBUG: Text content length: {len(text_content)}")
+        print(f"DEBUG: Structure recommendations result: {structure_recommendations}")
+        # ▲▲▲ END OF DEBUGGING LINES ▲▲▲
+
+        heading_findings = analyze_heading_structure(soup)
+        # ... rest of the function remains the same ...
+        heading_findings = analyze_heading_structure(soup)
+        semantic_findings = audit_semantic_html(soup)
+        readability_findings = analyze_readability(text_content)
+        existing_schema = audit_for_schema(soup)
+
+        recommendations = {"article_schema": None, "faq_schema": None}
+        if not existing_schema['Article']:
+            recommendations['article_schema'] = generate_article_schema(soup, url)
+        
+        if not existing_schema['FAQPage'] and topical_findings.get("structured_qna"):
+            recommendations['faq_schema'] = generate_faq_schema(topical_findings["structured_qna"])
+
+        return {
+            "url": url,
+            "title": title,
+            "structural_integrity": {"headings": heading_findings, "semantics": semantic_findings},
+            "readability": readability_findings,
+            "topical_gaps": {"raw_text": topical_findings.get("raw_text")},
+            "existing_schema": existing_schema,
+            "recommendations": recommendations,
+            "content_structure": structure_recommendations
+        }
+    ##llama-3.1-8b-instant
