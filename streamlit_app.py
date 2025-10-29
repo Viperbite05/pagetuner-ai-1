@@ -21,10 +21,24 @@ def flatten_results_for_csv(results):
             row = {'URL': result.get('url'), 'Error': result.get('error')}
             flat_data.append(row)
             continue
+            
+        # Get the new meta analysis data
+        meta_analysis = result.get('meta_analysis', {})
+        tags = meta_analysis.get('tags', {})
+        title_info = tags.get('title', {})
+        meta_info = tags.get('meta_description', {})
+        llm_sugs = meta_analysis.get('llm_suggestions', {})
 
         row = {
             'URL': result.get('url'),
             'Title': result.get('title'),
+            'Title Text': title_info.get('text'), # <-- NEW
+            'Title Length': title_info.get('length'), # <-- NEW
+            'Title Status': title_info.get('status'), # <-- NEW
+            'Meta Description Text': meta_info.get('text'), # <-- NEW
+            'Meta Description Length': meta_info.get('length'), # <-- NEW
+            'Meta Description Status': meta_info.get('status'), # <-- NEW
+            'LLM Title Suggestions': llm_sugs.get('suggestions', ''), # <-- NEW
             'Readability (Flesch Ease)': result.get('readability', {}).get('flesch_reading_ease'),
             'Structural Integrity - Headings': "\n".join(result.get('structural_integrity', {}).get('headings', [])),
             'Structural Integrity - Semantics': "\n".join(result.get('structural_integrity', {}).get('semantics', [])),
@@ -108,6 +122,31 @@ if 'results' in st.session_state:
             col1, col2 = st.columns(2)
 
             with col1:
+                # --- NEW SECTION: Title & Meta Analysis ---
+                st.subheader("Title & Meta Analysis")
+                meta_data = result.get('meta_analysis', {})
+                tags_data = meta_data.get('tags', {})
+                llm_data = meta_data.get('llm_suggestions', {})
+                
+                # Title
+                title_info = tags_data.get('title', {})
+                st.metric(f"Title Length ({title_info.get('status')})", f"{title_info.get('length')} / 65")
+                st.markdown("**Current Title**")
+                st.code(title_info.get('text'), language=None)
+                
+                # Meta Description
+                meta_info = tags_data.get('meta_description', {})
+                st.metric(f"Meta Desc. Length ({meta_info.get('status')})", f"{meta_info.get('length')} / 160")
+                st.markdown("**Current Meta Desc**")
+                st.code(meta_info.get('text'), language=None)
+                
+                # LLM Suggestions
+                st.markdown("**LLM Title Recommendations:**")
+                if llm_data and not llm_data.get('error'):
+                    st.code(llm_data.get('suggestions'), language=None)
+                else:
+                    st.info("No title suggestions were generated.")
+                # --- END OF NEW SECTION ---
                 # Section 1: Recommendations
                 st.subheader("Recommendations & Generated Assets")
                 st.markdown("**Article Schema:**")
